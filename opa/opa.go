@@ -33,11 +33,11 @@ const authAllowPath string = "data.docker.authz.allow"
 const buildAllowPath string = "data.docker.build.allow"
 
 // ValidateRequest validates a standard docker request (not build)
-// verifies against the ProxyPolicyFile using the path data.docker.authz.allow
+// verifies against the ProxyPolicyFile using the path data.docker.authz.allow and returns true if permitted
 func (p DockerOpaHandler) ValidateRequest(r *http.Request) (bool, error) {
+
 	if _, err := os.Stat(p.ProxyPolicyFile); os.IsNotExist(err) {
-		log.Warnf("OPA auth policy file %s does not exist", p.ProxyPolicyFile)
-		return true, err
+		return false, err
 	}
 
 	input, err := makeInput(r)
@@ -55,11 +55,12 @@ func (p DockerOpaHandler) ValidateRequest(r *http.Request) (bool, error) {
 func (p DockerOpaHandler) ValidateDockerFile(r *http.Request, dockerFile string) (bool, error) {
 	if _, err := os.Stat(p.DockerfilePolicyFile); os.IsNotExist(err) {
 		log.Warnf("OPA build policy file %s does not exist", p.DockerfilePolicyFile)
-		return true, err
+		return false, err
 	}
 
 	input, err := makeDockerfileInput(r, strings.Split(dockerFile, "\n"))
 	if err != nil {
+		log.Warnf("OPA build policy file %s parse error=%v", p.DockerfilePolicyFile, err)
 		return false, err
 	}
 
@@ -68,18 +69,15 @@ func (p DockerOpaHandler) ValidateDockerFile(r *http.Request, dockerFile string)
 	return allowed, err
 }
 
+// match request against policy from relevant rego file
 func processPolicy(ctx context.Context, policyFile string, policyPath string, input interface{}) (bool, error) {
-
+	// read policy file in on each request
 	bs, err := ioutil.ReadFile(policyFile)
+
 	if err != nil {
 		return false, err
 	}
 
-	// pretty, _ := json.MarshalIndent(input, "", "  ")
-	log.WithFields(log.Fields{
-		"policy":  policyPath,
-		"request": input,
-	}).Trace("Querying OPA policy")
 	allowed, err := func() (bool, error) {
 
 		eval := rego.New(
@@ -99,19 +97,13 @@ func processPolicy(ctx context.Context, policyFile string, policyPath string, in
 			return false, nil
 		}
 
-		log.WithFields(log.Fields{
-			"policy":    policyPath,
-			"resultSet": rs,
-		}).Trace("OPA Decision")
-
-		allowed, ok := rs[0].Expressions[0].Value.(bool)
+		permitted, ok := rs[0].Expressions[0].Value.(bool)
 
 		if !ok {
-			log.Trace("OPA administrative policy decision invalid")
 			return false, fmt.Errorf("OPA administrative policy decision invalid")
 		}
 
-		return allowed, nil
+		return permitted, nil
 
 	}()
 	if err != nil {
@@ -119,16 +111,17 @@ func processPolicy(ctx context.Context, policyFile string, policyPath string, in
 		return allowed, err
 	}
 
-	log.Tracef("Returning OPA policy decision: %v", allowed)
 	return allowed, nil
 }
 
+// decode json body and return input struct ready for evaluation
 func makeInput(r *http.Request) (interface{}, error) {
 
 	var body interface{}
 
 	if strings.HasPrefix(r.Header.Get("Content-Type"), "application/json") && r.ContentLength > 0 {
 		if err := json.NewDecoder(peekBody(r)).Decode(&body); err != nil {
+			log.Tracef("makeInput err=%v", err)
 			return nil, err
 		}
 	}

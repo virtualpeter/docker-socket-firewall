@@ -17,7 +17,6 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"time"
 
 	"github.com/linead/docker-socket-firewall/opa"
 
@@ -26,18 +25,18 @@ import (
 	"github.com/h2non/filetype/matchers"
 	log "github.com/sirupsen/logrus"
 	"github.com/xi2/xz"
-	"golang.org/x/net/context/ctxhttp"
 )
 
 var opaHandler opa.DockerHandler
 var targetSocket string
 var gitInfo string
+var noPing *bool
 
 /*
 	Reverse Proxy Logic
 */
 
-// Serve a reverse proxy for a given url
+// For a given url request, connect to targetSocket with a http client pass the req and
 func serveReverseProxy(w http.ResponseWriter, req *http.Request) {
 	transport := new(http.Transport)
 	sockets.ConfigureTransport(transport, "unix", targetSocket)
@@ -56,10 +55,10 @@ func serveReverseProxy(w http.ResponseWriter, req *http.Request) {
 			http.Error(w, "Unsupported upgrade protocol: "+req.Header.Get("Protocol"), http.StatusInternalServerError)
 			return
 		}
-		log.Debug("Connection upgrading")
+		log.Tracef("Connection upgrade requested to %s with method %v", req.Header.Get("Upgrade"), req.Method)
 		hijack(req, w)
 	} else {
-		resp, err := ctxhttp.Do(req.Context(), client, req)
+		resp, err := client.Do(req)
 
 		if err != nil {
 			log.Error(err)
@@ -84,36 +83,34 @@ func serveReverseProxy(w http.ResponseWriter, req *http.Request) {
 	}
 }
 
+//TODO: hikack doesnt watch the requests once /session is up - need to enhance so it can
+// use http client library call to establish connection then hijack it and set up goroutines to async handle send and receive
 func hijack(req *http.Request, w http.ResponseWriter) {
 	inConn, err := net.Dial("unix", targetSocket)
 
 	if err != nil {
-		log.Warnf("Error in connection %v", err)
+		log.Warnf("hijack: Error in connection %v", err)
 	}
 
-	if tcpConn, ok := inConn.(*net.TCPConn); ok {
-		tcpConn.SetKeepAlive(true)
-		tcpConn.SetKeepAlivePeriod(30 * time.Second)
-	}
-
+	// they really dont want us to be using NewClientConn here - but the current technique here is to establish the connection
+	// so it can then be hijacked.
 	clientconn := httputil.NewClientConn(inConn, nil)
 
 	// Server hijacks the connection, error 'connection closed' expected
 	resp, err := clientconn.Do(req)
 	if err != httputil.ErrPersistEOF {
 		if err != nil {
-			log.Errorf("error upgrading: %v", err)
+			log.Errorf("hijack: error upgrading: %v", err)
 		}
 		if resp.StatusCode != http.StatusSwitchingProtocols {
 			resp.Body.Close()
-			log.Errorf("unable to upgrade to %s, received %d", "tcp", resp.StatusCode)
+			log.Errorf("hijack: unable to upgrade to %s, received %d", "tcp", resp.StatusCode)
 		}
 	}
+	log.Tracef("hijack: NewClientConn err=%v", err)
 
-	log.Debugf("Response: %v", resp)
 	copyHeader(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
-
 	flushResponse(w)
 
 	c, br := clientconn.Hijack()
@@ -121,16 +118,18 @@ func hijack(req *http.Request, w http.ResponseWriter) {
 	hj, ok := w.(http.Hijacker)
 	if !ok {
 		http.Error(w, "webserver doesn't support hijacking", http.StatusInternalServerError)
+		log.Errorf("webserver doesn't support hijacking: %v", ok)
 		return
 	}
 	outConn, _, err := hj.Hijack()
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
+		log.Errorf("hijack: outConn err=%v", err)
 		return
 	}
 
 	if br.Buffered() > 0 {
-		log.Debugf("Found buffered bytes")
+		log.Tracef("Found buffered bytes")
 		var bs = make([]byte, br.Buffered())
 		br.Read(bs)
 		outConn.Write(bs)
@@ -140,9 +139,9 @@ func hijack(req *http.Request, w http.ResponseWriter) {
 	errBackend := make(chan error, 1)
 
 	streamFn := func(dst, src net.Conn, errc chan error, desc string) {
-		log.Debugf("%s Streaming connections", desc)
+		log.Tracef("hijack: %s Streaming connections", desc)
 		written, err := copyBuffer(dst, src)
-		log.Debugf("%s wrote %v, err: %v", desc, written, err)
+		log.Tracef("hijack: %s wrote %v, err: %v", desc, written, err)
 		errc <- err
 	}
 
@@ -152,15 +151,15 @@ func hijack(req *http.Request, w http.ResponseWriter) {
 	select {
 	case err = <-errClient:
 		if err != nil {
-			log.Error("hijack: Error when copying from docker to client")
+			log.Errorf("hijack: Error when copying from docker to client: %v", err)
 		} else {
-			log.Debugf("Closed connection by docker")
+			log.Trace("hijack: client closed connection")
 		}
 	case err = <-errBackend:
 		if err != nil {
 			log.Debugf("hijack: Error when copying from docker to client: %v", err)
 		} else {
-			log.Debug("Closed connection by docker")
+			log.Debug("hijack: backend closed connection")
 		}
 	}
 
@@ -170,13 +169,14 @@ func hijack(req *http.Request, w http.ResponseWriter) {
 	inConn.Close()
 }
 
+// when streaming - read all of buffer from src io.Reader and write to dst io.Writer
 func copyBuffer(dst io.Writer, src io.Reader) (int64, error) {
 	var buf = make([]byte, 100)
 	var written int64
 	for {
 		nr, rerr := src.Read(buf)
 		if rerr != nil && rerr != io.EOF && rerr != context.Canceled {
-			log.Debugf("read error during body copy: %v", rerr)
+			log.Errorf("copyBuffer: read error during body copy: %v", rerr)
 		}
 		if nr > 0 {
 			nw, werr := dst.Write(buf[:nr])
@@ -200,6 +200,7 @@ func copyBuffer(dst io.Writer, src io.Reader) (int64, error) {
 	}
 }
 
+// clone all the http headers in src request to dst request
 func copyHeader(dst, src http.Header) {
 	for k, vv := range src {
 		for _, v := range vv {
@@ -208,11 +209,17 @@ func copyHeader(dst, src http.Header) {
 	}
 }
 
+// sneak peek 262 bytes from a build request body to figure out what kind of tar compression
+// it is and then try and parse from it the path to the Dockerfile
+// if a Dockerfile path can be found then feed it to opa validator.
+// return true only if a Dockerfile is found and opa determmines valid.
+// BUG: does not handle build requests with no body gracefully.
 func verifyBuildInstruction(req *http.Request) (bool, error) {
 	//preserve original request if we want to still send it (Dockerfile is clean)
 	var buf bytes.Buffer
 	b := req.Body
 	var err error
+	var valid = true
 
 	if _, err = buf.ReadFrom(b); err != nil {
 		return false, err
@@ -224,87 +231,104 @@ func verifyBuildInstruction(req *http.Request) (bool, error) {
 
 	b1, b2 := bufio.NewReader(&buf), ioutil.NopCloser(bytes.NewReader(buf.Bytes()))
 
-	head, _ := b1.Peek(262)
-
-	var tr *tar.Reader
-
-	if filetype.IsType(head, matchers.TypeGz) {
-		gzipReader, _ := gzip.NewReader(b1)
-		tr = tar.NewReader(gzipReader)
-	} else if filetype.IsType(head, matchers.TypeBz2) {
-		bz2Reader := bzip2.NewReader(b1)
-		tr = tar.NewReader(bz2Reader)
-	} else if filetype.IsType(head, matchers.TypeXz) {
-		xzReader, _ := xz.NewReader(b1, 0)
-		tr = tar.NewReader(xzReader)
-	} else if filetype.IsType(head, matchers.TypeTar) {
-		tr = tar.NewReader(b1)
+	head, err := b1.Peek(262)
+	if err != nil {
+		log.Errorf("peek returned %d bytes before %v", len(head), err)
 	}
 
-	dockerfileLoc := req.URL.Query().Get("dockerfile")
+	if len(head) > 0 {
+		var tr *tar.Reader
 
-	if dockerfileLoc == "" {
-		dockerfileLoc = "Dockerfile"
+		if filetype.IsType(head, matchers.TypeGz) {
+			gzipReader, _ := gzip.NewReader(b1)
+			tr = tar.NewReader(gzipReader)
+		} else if filetype.IsType(head, matchers.TypeBz2) {
+			bz2Reader := bzip2.NewReader(b1)
+			tr = tar.NewReader(bz2Reader)
+		} else if filetype.IsType(head, matchers.TypeXz) {
+			xzReader, _ := xz.NewReader(b1, 0)
+			tr = tar.NewReader(xzReader)
+		} else if filetype.IsType(head, matchers.TypeTar) {
+			tr = tar.NewReader(b1)
+		} else {
+			log.Tracef("filetype tar reader not handled: %v", head)
+		}
+
+		dockerfileLoc := req.URL.Query().Get("dockerfile")
+
+		if dockerfileLoc == "" {
+			dockerfileLoc = "Dockerfile"
+		}
+		log.Tracef("Dockerfile name: %s", dockerfileLoc)
+
+		for {
+			hdr, err := tr.Next()
+			if err == io.EOF {
+				break // End of archive
+			}
+			if err != nil {
+				log.Error(err)
+			}
+			if hdr.Name == dockerfileLoc {
+				df, _ := ioutil.ReadAll(tr)
+				log.Tracef("Dockerfile size: %d", len(df))
+				valid, err = opaHandler.ValidateDockerFile(req, string(df))
+				if err != nil {
+					log.Error(err)
+				}
+			}
+		}
 	}
-
-	var valid = false
-
-	for {
-		hdr, err := tr.Next()
-		if err == io.EOF {
-			break // End of archive
-		}
-		if err != nil {
-			log.Fatal(err)
-		}
-		if hdr.Name == dockerfileLoc {
-			df, _ := ioutil.ReadAll(tr)
-			valid, _ = opaHandler.ValidateDockerFile(req, string(df))
-		}
-	}
-
 	if valid {
 		req.Body = b2
 	}
 
 	return valid, nil
-
 }
 
-// Given a request send it to the appropriate url if it validates
+// Given a uri - figure out if it a request or a build command and send it to the appropriate validator. If valid then pass
+// request to the backend. if not valid return http refusal.
 func handleRequestAndRedirect(res http.ResponseWriter, req *http.Request) {
-	matched, _ := regexp.MatchString("^(/v[\\d\\.]+)?/build$", req.URL.Path)
 
 	var err error
-	var allowed bool
+	allowed := false
 
-	if matched {
+	isPing, _ := regexp.MatchString("^/_ping$", req.URL.Path)
+	isSession, _ := regexp.MatchString("^(/v[\\d\\.]+)?/session$", req.URL.Path)
+	isBuild, _ := regexp.MatchString("^(/v[\\d\\.]+)?/build$", req.URL.Path)
+	if isPing {
+		allowed = !*noPing
+	} else if isSession {
+		allowed = true
+	} else if isBuild {
 		allowed, err = verifyBuildInstruction(req)
 	} else {
 		allowed, err = opaHandler.ValidateRequest(req)
 	}
 
 	if err != nil {
-		http.Error(res, "Authorization failure", http.StatusInternalServerError)
-		return
-	}
-
-	if allowed {
+		errMsg := fmt.Sprintf("Validation failure: err=%v", err)
 		log.WithFields(log.Fields{
-			"request":     req.URL.Path,
-			"disposition": "PERMIT",
-		}).Debug("docker-socket-firewall")
+			"policy": "DENIED",
+			"reason": errMsg,
+		}).Error(req.URL.Path)
+		http.Error(res, errMsg, http.StatusInternalServerError)
+	} else if allowed {
+		log.WithFields(log.Fields{
+			"policy": "PERMIT",
+		}).Debug(req.URL.Path)
 
 		serveReverseProxy(res, req)
 	} else {
 		http.Error(res, "Authorization denied", http.StatusUnavailableForLegalReasons)
 		log.WithFields(log.Fields{
-			"request":     req.URL.Path,
-			"disposition": "DENIED",
-		}).Debug("docker-socket-firewall")
+			"policy": "DENIED",
+		}).Error(req.URL.Path)
 	}
 }
 
+// open publicly RW named pipe and start http server on it. this is the named pipe the docker client
+// commands connect to
 func listenAndServe(sockPath string) error {
 	log.Tracef("initialising named pipe: %s", sockPath)
 	http.HandleFunc("/", handleRequestAndRedirect)
@@ -321,6 +345,7 @@ func listenAndServe(sockPath string) error {
 	return http.Serve(l, nil)
 }
 
+// flushResponse: flush http response write buffer
 func flushResponse(w io.Writer) {
 	flusher, ok := w.(http.Flusher)
 	if ok {
@@ -328,6 +353,8 @@ func flushResponse(w io.Writer) {
 	}
 }
 
+// setupLogFile: if -log cmdline arg is asserted then divert logging to nominated file - handle size limit by rolling away old log
+//               to .0 if it is over 10Mb.
 func setupLogFile(logPath string) {
 	oPath := logPath + ".0"
 
@@ -356,10 +383,7 @@ func setupLogFile(logPath string) {
 	log.SetOutput(f)
 }
 
-/*
-	Entry
-*/
-
+// Main Entrypoint
 func main() {
 
 	var hostSocket string
@@ -374,6 +398,7 @@ func main() {
 	verbose := flag.Bool("verbose", false, "Print debug level logging")
 	trace := flag.Bool("trace", false, "Print trace level logging")
 	version := flag.Bool("version", false, "only show version")
+	noPing = flag.Bool("noping", false, "block pings to force client to talk olde style api")
 
 	flag.Parse()
 
@@ -394,6 +419,12 @@ func main() {
 		}).Info("docker-socket-firewall started")
 
 		setupLogFile(logFile)
+	} else {
+		log.SetFormatter(&log.TextFormatter{
+			DisableLevelTruncation: true,
+			FullTimestamp:          true,
+			TimestampFormat:        "15:04:05.000000",
+		})
 	}
 
 	// have a way for admin to turn on tracing by touching this file
@@ -410,7 +441,8 @@ func main() {
 		log.SetLevel(log.TraceLevel)
 	}
 
-	// clean up old socket
+	// clean up old socket in case its a link
+	// TODO: some error handling would be nice
 	os.Remove(hostSocket)
 
 	proxyPolicyFile := filepath.Join(policyDir, "authz.rego")
@@ -430,10 +462,8 @@ func main() {
 
 	// validate target socket
 	if tInfo, err := os.Lstat(targetSocket); err == nil {
-		tPipe := targetSocket
 		if tInfo.Mode()&os.ModeSymlink != 0 {
-			if t, err := os.Readlink(targetSocket); err == nil {
-				tPipe = t
+			if tPipe, err := os.Readlink(targetSocket); err == nil {
 				log.Infof("%s is symlink to %s", targetSocket, tPipe)
 			} else {
 				log.Infof("%s is not symlink", targetSocket)
