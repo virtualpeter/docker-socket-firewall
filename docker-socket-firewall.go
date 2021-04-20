@@ -30,7 +30,7 @@ import (
 var opaHandler opa.DockerHandler
 var targetSocket string
 var gitInfo string
-var noPing *bool
+var doPing *bool
 
 /*
 	Reverse Proxy Logic
@@ -44,6 +44,7 @@ func serveReverseProxy(w http.ResponseWriter, req *http.Request) {
 		Transport: transport,
 	}
 
+	prettyReq, _ := byteDent(httputil.DumpRequest(req, false))
 	req.Proto = "http"
 	req.URL.Scheme = "http"
 	req.URL.Host = targetSocket
@@ -55,10 +56,13 @@ func serveReverseProxy(w http.ResponseWriter, req *http.Request) {
 			http.Error(w, "Unsupported upgrade protocol: "+req.Header.Get("Protocol"), http.StatusInternalServerError)
 			return
 		}
-		log.Tracef("Connection upgrade requested to %s with method %v", req.Header.Get("Upgrade"), req.Method)
+		log.Tracef("%s: REQ%s", req.Header.Get("Upgrade"), prettyReq)
 		hijack(req, w)
 	} else {
+		log.Tracef("http: REQ%s", prettyReq)
 		resp, err := client.Do(req)
+		prettyResp, _ := byteDent(httputil.DumpResponse(resp, false))
+		log.Tracef("http: RESP%s", prettyResp)
 
 		if err != nil {
 			log.Error(err)
@@ -81,6 +85,24 @@ func serveReverseProxy(w http.ResponseWriter, req *http.Request) {
 		flushResponse(w)
 		copyBuffer(w, resp.Body)
 	}
+}
+
+// Indent a bytearray for pretty printing
+func byteDent(src []byte, err error) ([]byte, error) {
+	dest := make([]byte, 0, 10000)
+	if err == nil {
+		dest = append(dest, "\n    "...)
+		for _, s := range src {
+			if s == '\n' {
+				dest = append(dest, "\n    "...)
+			} else {
+				dest = append(dest, s)
+			}
+		}
+	} else {
+		copy(dest, src)
+	}
+	return dest, err
 }
 
 //TODO: hikack doesnt watch the requests once /session is up - need to enhance so it can
@@ -297,7 +319,7 @@ func handleRequestAndRedirect(res http.ResponseWriter, req *http.Request) {
 	isSession, _ := regexp.MatchString("^(/v[\\d\\.]+)?/session$", req.URL.Path)
 	isBuild, _ := regexp.MatchString("^(/v[\\d\\.]+)?/build$", req.URL.Path)
 	if isPing {
-		allowed = !*noPing
+		allowed = *doPing
 	} else if isSession {
 		allowed = true
 	} else if isBuild {
@@ -398,7 +420,7 @@ func main() {
 	verbose := flag.Bool("verbose", false, "Print debug level logging")
 	trace := flag.Bool("trace", false, "Print trace level logging")
 	version := flag.Bool("version", false, "only show version")
-	noPing = flag.Bool("noping", false, "block pings to force client to talk olde style api")
+	doPing = flag.Bool("doping", false, "unblock pings")
 
 	flag.Parse()
 
