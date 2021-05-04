@@ -7,6 +7,7 @@ import (
 	"compress/bzip2"
 	"compress/gzip"
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -30,7 +31,6 @@ import (
 var opaHandler opa.DockerHandler
 var targetSocket string
 var gitInfo string
-var doPing *bool
 
 /*
 	Reverse Proxy Logic
@@ -72,6 +72,11 @@ func serveReverseProxy(w http.ResponseWriter, req *http.Request) {
 		defer resp.Body.Close()
 
 		copyHeader(w.Header(), resp.Header)
+
+		// Defaults the client to use the original builder instead of buildkit
+		if w.Header().Get("Builder-Version") == "2" {
+			w.Header().Set("Builder-Version", "1")
+		}
 
 		//If we're looking at a raw stream and we're not sending a value fo TE golang tries
 		//to chunk the response, which can break clients.
@@ -237,6 +242,12 @@ func copyHeader(dst, src http.Header) {
 // return true only if a Dockerfile is found and opa determmines valid.
 // BUG: does not handle build requests with no body gracefully.
 func verifyBuildInstruction(req *http.Request) (bool, error) {
+
+	// Disable builds that use buildkit because we won't be able to analyse the Dockerfile
+	if req.URL.Query().Get("version") == "2" {
+		return false, errors.New("BuildKit is not supported")
+	}
+
 	//preserve original request if we want to still send it (Dockerfile is clean)
 	var buf bytes.Buffer
 	b := req.Body
@@ -315,11 +326,12 @@ func handleRequestAndRedirect(res http.ResponseWriter, req *http.Request) {
 	var err error
 	allowed := false
 
-	isPing, _ := regexp.MatchString("^/_ping$", req.URL.Path)
+	isGrpc, _ := regexp.MatchString("^/grpc", req.URL.Path)
 	isSession, _ := regexp.MatchString("^(/v[\\d\\.]+)?/session$", req.URL.Path)
 	isBuild, _ := regexp.MatchString("^(/v[\\d\\.]+)?/build$", req.URL.Path)
-	if isPing {
-		allowed = *doPing
+	if isGrpc {
+		// Block grpc because we won't be able to mitm it
+		allowed = false
 	} else if isSession {
 		allowed = true
 	} else if isBuild {
@@ -420,7 +432,6 @@ func main() {
 	verbose := flag.Bool("verbose", false, "Print debug level logging")
 	trace := flag.Bool("trace", false, "Print trace level logging")
 	version := flag.Bool("version", false, "only show version")
-	doPing = flag.Bool("doping", false, "unblock pings")
 
 	flag.Parse()
 
